@@ -1,0 +1,203 @@
+<%@ page import="java.io.*,java.net.*,java.net.http.*,java.nio.charset.StandardCharsets,java.security.*,java.time.*,java.util.*,java.util.concurrent.*,java.util.regex.Pattern,javax.crypto.Mac,javax.crypto.spec.SecretKeySpec,jakarta.servlet.ServletContext,jakarta.servlet.http.*,com.google.gson.*" %><%!
+  private static final Gson GSON = new Gson();
+  private static final Pattern REF_ID = Pattern.compile("^[A-Za-z0-9_-]{1,64}$");
+  private static final long IDEMPOTENCY_TTL_MS = 24L * 60L * 60L * 1000L;
+  private static final String DEFAULT_DEV_TOKEN = "dev-java-service-token-at-least-32-chars";
+  private static final String DEV_CALLBACK_SECRET = initRandomHex(32);
+  private static final Map<String, String> DOTENV = loadDotEnv();
+
+  private static Map<String, String> loadDotEnv() {
+    Map<String, String> map = new ConcurrentHashMap<String, String>();
+    File f = new File(".env");
+    if (!f.isFile()) return map;
+    try (BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(f), StandardCharsets.UTF_8))) {
+      String line;
+      while ((line = br.readLine()) != null) {
+        String trimmed = line.trim();
+        if (trimmed.isEmpty() || trimmed.startsWith("#")) continue;
+        int eq = trimmed.indexOf('=');
+        if (eq <= 0) continue;
+        String k = trimmed.substring(0, eq).trim();
+        String v = trimmed.substring(eq + 1).trim();
+        if ((v.startsWith("\"") && v.endsWith("\"")) || (v.startsWith("'") && v.endsWith("'"))) {
+          if (v.length() >= 2) v = v.substring(1, v.length() - 1);
+        }
+        map.put(k, v);
+      }
+    } catch (IOException ignored) {
+      // Optional .env file
+    }
+    return map;
+  }
+
+  private static String initRandomHex(int bytes) {
+    byte[] buf = new byte[bytes];
+    new SecureRandom().nextBytes(buf);
+    StringBuilder sb = new StringBuilder(bytes * 2);
+    for (byte b : buf) {
+      sb.append(Character.forDigit((b >> 4) & 0xF, 16));
+      sb.append(Character.forDigit(b & 0xF, 16));
+    }
+    return sb.toString();
+  }
+
+  private static String cfg(String key, String fallback) {
+    String prop = System.getProperty(key);
+    if (prop != null && !prop.trim().isEmpty()) return prop.trim();
+    String env = System.getenv(key);
+    if (env != null && !env.trim().isEmpty()) return env.trim();
+    String dot = DOTENV.get(key);
+    return (dot != null && !dot.trim().isEmpty()) ? dot.trim() : fallback;
+  }
+
+  private static boolean isProductionEnv() {
+    String env = cfg("APP_ENV", cfg("NODE_ENV", "development")).toLowerCase();
+    return "production".equals(env);
+  }
+
+  private static String serviceToken() {
+    String t = cfg("JAVA_SERVICE_TOKEN", "");
+    if (isProductionEnv() && t.length() < 32) {
+      throw new IllegalStateException("JAVA_SERVICE_TOKEN must be at least 32 characters in production");
+    }
+    return t.isEmpty() ? DEFAULT_DEV_TOKEN : t;
+  }
+
+  private static String callbackSecret() {
+    String s = cfg("JAVA_CALLBACK_SECRET", "");
+    if (isProductionEnv() && s.length() < 32) {
+      throw new IllegalStateException("JAVA_CALLBACK_SECRET must be at least 32 characters in production");
+    }
+    return s.isEmpty() ? DEV_CALLBACK_SECRET : s;
+  }
+
+  private static String nodeCallbackUrl() {
+    return cfg("NODE_CALLBACK_URL", "http://127.0.0.1:4101/internal/v1/payments/events");
+  }
+
+  private static String razorpayKeyId() {
+    return cfg("RAZORPAY_KEY_ID", "");
+  }
+
+  private static String razorpayKeySecret() {
+    return cfg("RAZORPAY_KEY_SECRET", "");
+  }
+
+  private static String razorpayWebhookSecret() {
+    String s = cfg("RAZORPAY_WEBHOOK_SECRET", "");
+    return s.isEmpty() ? cfg("PROVIDER_WEBHOOK_SECRET", "") : s;
+  }
+
+  private static String activeGatewayName() {
+    String defaultGw = (isProductionEnv() || !razorpayKeyId().isEmpty()) ? "razorpay" : "mock";
+    return cfg("PAYMENT_GATEWAY", defaultGw).toLowerCase();
+  }
+
+  private static boolean constantTimeEquals(String a, String b) {
+    if (a == null || b == null) return false;
+    return MessageDigest.isEqual(a.getBytes(StandardCharsets.UTF_8), b.getBytes(StandardCharsets.UTF_8));
+  }
+
+  private static String hmacSha256Hex(String secret, byte[] data) {
+    try {
+      Mac mac = Mac.getInstance("HmacSHA256");
+      mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+      byte[] digest = mac.doFinal(data);
+      StringBuilder sb = new StringBuilder(digest.length * 2);
+      for (byte b : digest) {
+        sb.append(Character.forDigit((b >> 4) & 0xF, 16));
+        sb.append(Character.forDigit(b & 0xF, 16));
+      }
+      return sb.toString();
+    } catch (Exception e) {
+      throw new IllegalStateException("HMAC computation failed", e);
+    }
+  }
+
+  private static String signNodeCallback(String secret, String timestampMs, byte[] rawBody) {
+    byte[] prefix = (timestampMs + "\n").getBytes(StandardCharsets.UTF_8);
+    byte[] canonical = new byte[prefix.length + rawBody.length];
+    System.arraycopy(prefix, 0, canonical, 0, prefix.length);
+    System.arraycopy(rawBody, 0, canonical, prefix.length, rawBody.length);
+    return "v1=" + hmacSha256Hex(secret, canonical);
+  }
+
+  private static boolean verifyProviderSignature(String secret, byte[] rawBody, String givenHex) {
+    if (secret == null || secret.isEmpty() || givenHex == null || givenHex.isEmpty()) return false;
+    return constantTimeEquals(hmacSha256Hex(secret, rawBody), givenHex.trim().toLowerCase());
+  }
+
+  private static boolean authenticateInternalRequest(HttpServletRequest req, HttpServletResponse res) throws IOException {
+    String reqId = req.getHeader("X-Request-ID");
+    if (reqId == null || reqId.trim().isEmpty()) reqId = UUID.randomUUID().toString();
+    res.setHeader("X-Request-ID", reqId);
+
+    String auth = req.getHeader("Authorization");
+    String token = (auth != null && auth.regionMatches(true, 0, "Bearer ", 0, 7)) ? auth.substring(7).trim() : "";
+    if (!constantTimeEquals(serviceToken(), token)) {
+      res.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+      res.setContentType("application/json;charset=UTF-8");
+      res.getWriter().write(GSON.toJson(Map.of("success", false, "code", "UNAUTHORIZED", "message", "Invalid or missing service token")));
+      return false;
+    }
+    return true;
+  }
+
+  @SuppressWarnings("unchecked")
+  private static Map<String, Map<String, Object>> getOrdersStore(ServletContext ctx) {
+    synchronized (ctx) {
+      Map<String, Map<String, Object>> m = (Map<String, Map<String, Object>>) ctx.getAttribute("aaitrip.ordersById");
+      if (m == null) {
+        m = new ConcurrentHashMap<String, Map<String, Object>>();
+        ctx.setAttribute("aaitrip.ordersById", m);
+      }
+      return m;
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private static Map<String, String> getProviderIndex(ServletContext ctx) {
+    synchronized (ctx) {
+      Map<String, String> m = (Map<String, String>) ctx.getAttribute("aaitrip.idByProviderOrderId");
+      if (m == null) {
+        m = new ConcurrentHashMap<String, String>();
+        ctx.setAttribute("aaitrip.idByProviderOrderId", m);
+      }
+      return m;
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private static Map<String, Map<String, Object>> getIdempotencyStore(ServletContext ctx) {
+    synchronized (ctx) {
+      Map<String, Map<String, Object>> m = (Map<String, Map<String, Object>>) ctx.getAttribute("aaitrip.idempotencyStore");
+      if (m == null) {
+        m = new ConcurrentHashMap<String, Map<String, Object>>();
+        ctx.setAttribute("aaitrip.idempotencyStore", m);
+      }
+      return m;
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private static List<Map<String, Object>> getCallbackLogs(ServletContext ctx) {
+    synchronized (ctx) {
+      List<Map<String, Object>> l = (List<Map<String, Object>>) ctx.getAttribute("aaitrip.callbackLogs");
+      if (l == null) {
+        l = new CopyOnWriteArrayList<Map<String, Object>>();
+        ctx.setAttribute("aaitrip.callbackLogs", l);
+      }
+      return l;
+    }
+  }
+
+  private static String escHtml(Object v) {
+    if (v == null) return "";
+    return String.valueOf(v)
+      .replace("&", "&amp;")
+      .replace("<", "&lt;")
+      .replace(">", "&gt;")
+      .replace("\"", "&quot;")
+      .replace("'", "&#39;");
+  }
+%>

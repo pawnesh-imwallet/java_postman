@@ -1,0 +1,253 @@
+<%!
+  private static final HttpClient GW_HTTP = HttpClient.newBuilder()
+      .connectTimeout(Duration.ofSeconds(4))
+      .build();
+
+  /**
+   * Pluggable Payment Gateway Dispatcher (Pure JSP, no frameworks).
+   * To add a new gateway (e.g. "cashfree", "phonepe", "stripe"):
+   *   1. Add a case in createGatewayOrder(...) and parseAndVerifyGatewayWebhook(...).
+   *   2. Set PAYMENT_GATEWAY=<provider> in environment variables.
+   */
+  private static Map<String, Object> createGatewayOrder(
+      String provider,
+      String paymentOrderId,
+      String bookingId,
+      String userId,
+      long amountMinor,
+      String currency) {
+    Map<String, Object> out = new LinkedHashMap<String, Object>();
+
+    if ("razorpay".equals(provider)) {
+      String keyId = razorpayKeyId();
+      String keySecret = razorpayKeySecret();
+      if (keyId.isEmpty() || keySecret.isEmpty()) {
+        out.put("ok", false);
+        out.put("httpStatus", 503);
+        out.put("code", "GATEWAY_NOT_CONFIGURED");
+        out.put("message", "Razorpay credentials are not configured");
+        return out;
+      }
+
+      JsonObject notes = new JsonObject();
+      notes.addProperty("bookingId", bookingId);
+      notes.addProperty("userId", userId);
+      notes.addProperty("paymentOrderId", paymentOrderId);
+
+      JsonObject payload = new JsonObject();
+      payload.addProperty("amount", amountMinor);
+      payload.addProperty("currency", currency);
+      payload.addProperty("receipt", paymentOrderId);
+      payload.add("notes", notes);
+
+      String auth = Base64.getEncoder().encodeToString((keyId + ":" + keySecret).getBytes(StandardCharsets.UTF_8));
+      try {
+        HttpRequest httpReq = HttpRequest.newBuilder()
+            .uri(URI.create("https://api.razorpay.com/v1/orders"))
+            .timeout(Duration.ofSeconds(5))
+            .header("Authorization", "Basic " + auth)
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(payload.toString(), StandardCharsets.UTF_8))
+            .build();
+        HttpResponse<String> r = GW_HTTP.send(httpReq, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        int status = r.statusCode();
+        if (status >= 400 && status < 500) {
+          out.put("ok", false);
+          out.put("httpStatus", 400);
+          out.put("code", "PAYMENT_REJECTED");
+          out.put("message", "Razorpay rejected order creation");
+          return out;
+        }
+        if (status < 200 || status >= 300) {
+          out.put("ok", false);
+          out.put("httpStatus", 502);
+          out.put("code", "GATEWAY_UPSTREAM_ERROR");
+          out.put("message", "Razorpay returned HTTP " + status);
+          return out;
+        }
+        JsonObject json = JsonParser.parseString(r.body()).getAsJsonObject();
+        String rzpOrderId = json.has("id") ? json.get("id").getAsString() : "";
+        if (rzpOrderId.isEmpty()) {
+          out.put("ok", false);
+          out.put("httpStatus", 502);
+          out.put("code", "GATEWAY_BAD_RESPONSE");
+          out.put("message", "Missing Razorpay order id");
+          return out;
+        }
+        Map<String, String> checkout = new LinkedHashMap<String, String>();
+        checkout.put("keyId", keyId);
+        checkout.put("orderId", rzpOrderId);
+        checkout.put("amount", String.valueOf(amountMinor));
+        checkout.put("currency", currency);
+
+        out.put("ok", true);
+        out.put("providerOrderId", rzpOrderId);
+        out.put("status", "created");
+        out.put("checkoutParams", checkout);
+        return out;
+      } catch (Exception e) {
+        out.put("ok", false);
+        out.put("httpStatus", 503);
+        out.put("code", "GATEWAY_UNREACHABLE");
+        out.put("message", "Could not reach Razorpay");
+        return out;
+      }
+    }
+
+    if ("mock".equals(provider)) {
+      String providerOrderId = "order_mock_" + paymentOrderId.replace("po_", "");
+      Map<String, String> checkout = new LinkedHashMap<String, String>();
+      checkout.put("mode", "mock");
+      checkout.put("orderId", providerOrderId);
+      out.put("ok", true);
+      out.put("providerOrderId", providerOrderId);
+      out.put("status", "created");
+      out.put("checkoutParams", checkout);
+      return out;
+    }
+
+    out.put("ok", false);
+    out.put("httpStatus", 500);
+    out.put("code", "UNSUPPORTED_GATEWAY");
+    out.put("message", "Unsupported PAYMENT_GATEWAY: " + provider);
+    return out;
+  }
+
+  private static String mapRazorpayEventStatus(String event) {
+    if ("payment.captured".equals(event) || "order.paid".equals(event)) return "captured";
+    if ("payment.failed".equals(event)) return "failed";
+    if ("refund.processed".equals(event) || "payment.refunded".equals(event)) return "refunded";
+    if ("payment.authorized".equals(event)) return "pending";
+    return null;
+  }
+
+  private static Map<String, Object> parseAndVerifyGatewayWebhook(
+      String provider,
+      HttpServletRequest req,
+      byte[] rawBody) {
+    Map<String, Object> out = new LinkedHashMap<String, Object>();
+
+    if ("razorpay".equals(provider)) {
+      String secret = razorpayWebhookSecret();
+      if (!secret.isEmpty()) {
+        String sig = req.getHeader("X-Razorpay-Signature");
+        if (!verifyProviderSignature(secret, rawBody, sig)) {
+          out.put("ok", false);
+          out.put("httpStatus", 401);
+          out.put("code", "WEBHOOK_SIGNATURE_INVALID");
+          out.put("message", "Invalid Razorpay signature");
+          return out;
+        }
+      } else if (isProductionEnv()) {
+        out.put("ok", false);
+        out.put("httpStatus", 503);
+        out.put("code", "WEBHOOK_NOT_CONFIGURED");
+        out.put("message", "Razorpay webhook secret not configured");
+        return out;
+      }
+
+      JsonObject json;
+      try {
+        json = JsonParser.parseString(new String(rawBody, StandardCharsets.UTF_8)).getAsJsonObject();
+      } catch (Exception e) {
+        out.put("ok", false);
+        out.put("httpStatus", 400);
+        out.put("code", "INVALID_JSON");
+        out.put("message", "Webhook body is not valid JSON");
+        return out;
+      }
+
+      if (json.has("event") && json.has("payload")) {
+        String event = json.get("event").getAsString().trim();
+        String status = mapRazorpayEventStatus(event);
+        if (status == null) {
+          out.put("ok", false);
+          out.put("httpStatus", 400);
+          out.put("code", "UNSUPPORTED_EVENT");
+          out.put("message", "Unsupported Razorpay event: " + event);
+          return out;
+        }
+        JsonObject p = json.getAsJsonObject("payload");
+        String orderId = null;
+        if (p.has("payment") && p.getAsJsonObject("payment").has("entity")) {
+          JsonObject e = p.getAsJsonObject("payment").getAsJsonObject("entity");
+          if (e.has("order_id") && !e.get("order_id").isJsonNull()) orderId = e.get("order_id").getAsString().trim();
+        }
+        if ((orderId == null || orderId.isEmpty()) && p.has("order") && p.getAsJsonObject("order").has("entity")) {
+          JsonObject e = p.getAsJsonObject("order").getAsJsonObject("entity");
+          if (e.has("id") && !e.get("id").isJsonNull()) orderId = e.get("id").getAsString().trim();
+        }
+        if (orderId == null || orderId.isEmpty()) {
+          out.put("ok", false);
+          out.put("httpStatus", 400);
+          out.put("code", "VALIDATION_ERROR");
+          out.put("message", "Missing order_id in Razorpay webhook");
+          return out;
+        }
+        out.put("ok", true);
+        out.put("providerOrderId", orderId);
+        out.put("paymentOrderId", "");
+        out.put("normalizedStatus", status);
+        return out;
+      }
+
+      String paymentOrderId = json.has("paymentOrderId") ? json.get("paymentOrderId").getAsString().trim() : "";
+      String providerOrderId = json.has("providerOrderId") ? json.get("providerOrderId").getAsString().trim() : "";
+      String status = json.has("status") ? json.get("status").getAsString().trim() : "";
+      if ((paymentOrderId.isEmpty() && providerOrderId.isEmpty()) || status.isEmpty()) {
+        out.put("ok", false);
+        out.put("httpStatus", 400);
+        out.put("code", "VALIDATION_ERROR");
+        out.put("message", "Missing order reference or status");
+        return out;
+      }
+      out.put("ok", true);
+      out.put("providerOrderId", providerOrderId);
+      out.put("paymentOrderId", paymentOrderId);
+      out.put("normalizedStatus", status);
+      return out;
+    }
+
+    if ("mock".equals(provider)) {
+      String secret = razorpayWebhookSecret();
+      String sig = req.getHeader("X-Webhook-Signature");
+      if (!secret.isEmpty() && sig != null && !verifyProviderSignature(secret, rawBody, sig)) {
+        out.put("ok", false);
+        out.put("httpStatus", 401);
+        out.put("code", "WEBHOOK_SIGNATURE_INVALID");
+        out.put("message", "Invalid mock webhook signature");
+        return out;
+      }
+      try {
+        JsonObject json = JsonParser.parseString(new String(rawBody, StandardCharsets.UTF_8)).getAsJsonObject();
+        String paymentOrderId = json.has("paymentOrderId") ? json.get("paymentOrderId").getAsString().trim() : "";
+        String providerOrderId = json.has("providerOrderId") ? json.get("providerOrderId").getAsString().trim() : "";
+        String status = json.has("status") ? json.get("status").getAsString().trim() : "";
+        if ((paymentOrderId.isEmpty() && providerOrderId.isEmpty()) || status.isEmpty()) {
+          out.put("ok", false);
+          out.put("httpStatus", 400);
+          out.put("code", "VALIDATION_ERROR");
+          out.put("message", "paymentOrderId/providerOrderId and status required");
+          return out;
+        }
+        out.put("ok", true);
+        out.put("providerOrderId", providerOrderId);
+        out.put("paymentOrderId", paymentOrderId);
+        out.put("normalizedStatus", status);
+        return out;
+      } catch (Exception e) {
+        out.put("ok", false);
+        out.put("httpStatus", 400);
+        out.put("code", "INVALID_JSON");
+        out.put("message", "Invalid JSON body");
+        return out;
+      }
+    }
+
+    out.put("ok", false);
+    out.put("httpStatus", 404);
+    out.put("code", "UNKNOWN_PROVIDER");
+    out.put("message", "Unsupported payment provider");
+    return out;
+  }
+%>

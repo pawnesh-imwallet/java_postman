@@ -1,0 +1,224 @@
+{
+  "info": {
+    "name": "AAITrip E2E (Auth OTP + Java Razorpay)",
+    "_postman_id": "aaitrip-e2e-v1",
+    "description": "Automated end-to-end flow: Mobile OTP Login (Node :4100) -> Create Payment Order (Node -> Java :8082 -> Razorpay) -> Webhook -> Order Status.\nRequires: node ./scripts/postman-signer.mjs running on http://127.0.0.1:4999",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "node_url", "value": "http://localhost:4100" },
+    { "key": "java_url", "value": "http://localhost:8082" },
+    { "key": "signer_url", "value": "http://127.0.0.1:4999" },
+    { "key": "phone", "value": "9876543210" },
+    { "key": "otp", "value": "123456" },
+    { "key": "razorpay_webhook_secret", "value": "" },
+    { "key": "device_id", "value": "" },
+    { "key": "device_public_key", "value": "" },
+    { "key": "login_nonce", "value": "" },
+    { "key": "login_signature", "value": "" },
+    { "key": "req_nonce", "value": "" },
+    { "key": "req_signature", "value": "" },
+    { "key": "user_access_token", "value": "" },
+    { "key": "payment_order_id", "value": "" },
+    { "key": "provider_order_id", "value": "" },
+    { "key": "rzp_signature", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "1. Send OTP (Node)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"userPhoneNumber\": \"{{phone}}\"\n}"
+        },
+        "url": "{{node_url}}/api/auth/v1/send-otp"
+      }
+    },
+    {
+      "name": "2. Verify OTP & Login (Auto Challenge + Sign)",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const signerUrl = pm.collectionVariables.get('signer_url');",
+              "const nodeUrl = pm.collectionVariables.get('node_url');",
+              "const phone = pm.collectionVariables.get('phone');",
+              "pm.sendRequest(signerUrl + '/device', (err, devRes) => {",
+              "  if (err) throw err;",
+              "  const dev = devRes.json();",
+              "  pm.collectionVariables.set('device_id', dev.deviceId);",
+              "  pm.collectionVariables.set('device_public_key', dev.publicKey);",
+              "  pm.sendRequest({",
+              "    url: nodeUrl + '/api/auth/v1/challenge',",
+              "    method: 'POST',",
+              "    header: { 'Content-Type': 'application/json' },",
+              "    body: { mode: 'raw', raw: JSON.stringify({ deviceId: dev.deviceId, purpose: 'login' }) }",
+              "  }, (err2, chRes) => {",
+              "    if (err2) throw err2;",
+              "    const nonce = chRes.json().data.nonce;",
+              "    pm.collectionVariables.set('login_nonce', nonce);",
+              "    pm.sendRequest({",
+              "      url: signerUrl + '/sign',",
+              "      method: 'POST',",
+              "      header: { 'Content-Type': 'application/json' },",
+              "      body: { mode: 'raw', raw: JSON.stringify({ purpose: 'login', nonce, identifier: phone }) }",
+              "    }, (err3, sigRes) => {",
+              "      if (err3) throw err3;",
+              "      pm.collectionVariables.set('login_signature', sigRes.json().signature);",
+              "    });",
+              "  });",
+              "});"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "if (json && json.data && json.data.accessToken) {",
+              "  pm.collectionVariables.set('user_access_token', json.data.accessToken);",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"userPhoneNumber\": \"{{phone}}\",\n  \"otp\": \"{{otp}}\",\n  \"nonce\": \"{{login_nonce}}\",\n  \"signature\": \"{{login_signature}}\",\n  \"device\": {\n    \"deviceId\": \"{{device_id}}\",\n    \"platform\": \"web\",\n    \"publicKey\": \"{{device_public_key}}\",\n    \"name\": \"Postman Web\",\n    \"appVersion\": \"1.0.0\"\n  }\n}"
+        },
+        "url": "{{node_url}}/api/auth/v1/verify-otp"
+      }
+    },
+    {
+      "name": "3. Get Profile /me (Node)",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{user_access_token}}" },
+          { "key": "X-Device-ID", "value": "{{device_id}}" }
+        ],
+        "url": "{{node_url}}/api/auth/v1/me"
+      }
+    },
+    {
+      "name": "4. Create Payment Order (Node -> Java -> Razorpay, Auto Sign)",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const signerUrl = pm.collectionVariables.get('signer_url');",
+              "const nodeUrl = pm.collectionVariables.get('node_url');",
+              "const deviceId = pm.collectionVariables.get('device_id');",
+              "const rawBody = pm.request.body.raw;",
+              "pm.sendRequest({",
+              "  url: nodeUrl + '/api/auth/v1/challenge',",
+              "  method: 'POST',",
+              "  header: { 'Content-Type': 'application/json' },",
+              "  body: { mode: 'raw', raw: JSON.stringify({ deviceId, purpose: 'request' }) }",
+              "}, (err, chRes) => {",
+              "  if (err) throw err;",
+              "  const nonce = chRes.json().data.nonce;",
+              "  pm.collectionVariables.set('req_nonce', nonce);",
+              "  pm.sendRequest({",
+              "    url: signerUrl + '/sign',",
+              "    method: 'POST',",
+              "    header: { 'Content-Type': 'application/json' },",
+              "    body: { mode: 'raw', raw: JSON.stringify({ purpose: 'request', nonce, method: 'POST', path: '/api/payments/v1/orders', body: rawBody }) }",
+              "  }, (err2, sigRes) => {",
+              "    if (err2) throw err2;",
+              "    pm.collectionVariables.set('req_signature', sigRes.json().signature);",
+              "  });",
+              "});"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "if (json && json.data && json.data.order) {",
+              "  pm.collectionVariables.set('payment_order_id', json.data.order.paymentOrderId);",
+              "  pm.collectionVariables.set('provider_order_id', json.data.order.providerOrderId);",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{user_access_token}}" },
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Device-ID", "value": "{{device_id}}" },
+          { "key": "X-Signature-Nonce", "value": "{{req_nonce}}" },
+          { "key": "X-Signature", "value": "{{req_signature}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"bookingId\":\"bk_bus_101\",\"amountMinor\":150000,\"currency\":\"INR\",\"idempotencyKey\":\"bk_bus_101-attempt-1\"}"
+        },
+        "url": "{{node_url}}/api/payments/v1/orders"
+      }
+    },
+    {
+      "name": "5. Razorpay Webhook (Java -> Node Callback, Auto HMAC)",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const secret = pm.collectionVariables.get('razorpay_webhook_secret') || '';",
+              "if (secret) {",
+              "  const body = pm.request.body.raw.replace('{{provider_order_id}}', pm.collectionVariables.get('provider_order_id'));",
+              "  const sig = CryptoJS.HmacSHA256(body, secret).toString(CryptoJS.enc.Hex);",
+              "  pm.collectionVariables.set('rzp_signature', sig);",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Razorpay-Event-Id", "value": "evt_rzp_{{$timestamp}}" },
+          { "key": "X-Razorpay-Signature", "value": "{{rzp_signature}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"event\": \"payment.captured\",\n  \"payload\": {\n    \"payment\": {\n      \"entity\": {\n        \"order_id\": \"{{provider_order_id}}\"\n      }\n    }\n  }\n}"
+        },
+        "url": "{{java_url}}/api/payments/v1/webhooks/razorpay"
+      }
+    },
+    {
+      "name": "6. Get Final Payment Order Status (Node -> Java)",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{user_access_token}}" },
+          { "key": "X-Device-ID", "value": "{{device_id}}" }
+        ],
+        "url": "{{node_url}}/api/payments/v1/orders/{{payment_order_id}}"
+      }
+    }
+  ]
+}

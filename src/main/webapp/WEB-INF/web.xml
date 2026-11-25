@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<web-app xmlns="https://jakarta.ee/xml/ns/jakartaee"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="https://jakarta.ee/xml/ns/jakartaee https://jakarta.ee/xml/ns/jakartaee/web-app_6_0.xsd"
+         version="6.0">
+    <display-name>AAITrip Java Payments (Pure JSP)</display-name>
+
+    <request-character-encoding>UTF-8</request-character-encoding>
+    <response-character-encoding>UTF-8</response-character-encoding>
+
+    <session-config>
+        <cookie-config>
+            <http-only>true</http-only>
+        </cookie-config>
+    </session-config>
+
+    <!-- Pure JSP URL routing (no .java Servlet classes, no framework) -->
+    <servlet>
+        <servlet-name>ordersJsp</servlet-name>
+        <jsp-file>/WEB-INF/jsp/orders.jsp</jsp-file>
+    </servlet>
+    <servlet-mapping>
+        <servlet-name>ordersJsp</servlet-name>
+        <url-pattern>/internal/payments/orders</url-pattern>
+        <url-pattern>/internal/payments/orders/*</url-pattern>
+    </servlet-mapping>
+
+    <servlet>
+        <servlet-name>webhookJsp</servlet-name>
+        <jsp-file>/WEB-INF/jsp/webhook.jsp</jsp-file>
+    </servlet>
+    <servlet-mapping>
+        <servlet-name>webhookJsp</servlet-name>
+        <url-pattern>/api/payments/v1/webhooks/*</url-pattern>
+    </servlet-mapping>
+
+    <servlet>
+        <servlet-name>healthJsp</servlet-name>
+        <jsp-file>/WEB-INF/jsp/health.jsp</jsp-file>
+    </servlet>
+    <servlet-mapping>
+        <servlet-name>healthJsp</servlet-name>
+        <url-pattern>/health</url-pattern>
+    </servlet-mapping>
+
+    <servlet>
+        <servlet-name>dashboardJsp</servlet-name>
+        <jsp-file>/WEB-INF/jsp/dashboard.jsp</jsp-file>
+    </servlet>
+    <servlet-mapping>
+        <servlet-name>dashboardJsp</servlet-name>
+        <url-pattern></url-pattern>
+        <url-pattern>/dashboard</url-pattern>
+        <url-pattern>/payments/simulate</url-pattern>
+    </servlet-mapping>
+
+    <!-- Sanitized error responses: never expose Tomcat/Jetty stack traces -->
+    <error-page>
+        <error-code>404</error-code>
+        <location>/WEB-INF/jsp/error.jsp</location>
+    </error-page>
+    <error-page>
+        <error-code>500</error-code>
+        <location>/WEB-INF/jsp/error.jsp</location>
+    </error-page>
+    <error-page>
+        <exception-type>java.lang.Throwable</exception-type>
+        <location>/WEB-INF/jsp/error.jsp</location>
+    </error-page>
+</web-app>

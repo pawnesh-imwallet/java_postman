@@ -1,0 +1,75 @@
+<%!
+  private static final HttpClient NODE_CB_HTTP = HttpClient.newBuilder()
+      .connectTimeout(Duration.ofSeconds(5))
+      .build();
+
+  private static int sendNodePaymentEvent(ServletContext ctx, Map<String, Object> order, String status) {
+    String eventId = "evt_" + UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+    String secret = callbackSecret();
+    String targetUrl = nodeCallbackUrl();
+
+    Map<String, Object> payload = new LinkedHashMap<String, Object>();
+    payload.put("eventId", eventId);
+    payload.put("paymentOrderId", order.get("paymentOrderId"));
+    payload.put("bookingId", order.get("bookingId"));
+    payload.put("status", status);
+    payload.put("amountMinor", order.get("amountMinor"));
+    payload.put("currency", order.get("currency"));
+    payload.put("occurredAt", Instant.now().toString());
+
+    byte[] rawBody = GSON.toJson(payload).getBytes(StandardCharsets.UTF_8);
+
+    int lastStatus = 0;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      String ts = String.valueOf(System.currentTimeMillis());
+      String sig = signNodeCallback(secret, ts, rawBody);
+      try {
+        HttpRequest req = HttpRequest.newBuilder()
+            .uri(URI.create(targetUrl))
+            .timeout(Duration.ofSeconds(5))
+            .header("Content-Type", "application/json")
+            .header("X-Payments-Timestamp", ts)
+            .header("X-Payments-Signature", sig)
+            .POST(HttpRequest.BodyPublishers.ofByteArray(rawBody))
+            .build();
+        HttpResponse<Void> r = NODE_CB_HTTP.send(req, HttpResponse.BodyHandlers.discarding());
+        lastStatus = r.statusCode();
+        if (lastStatus >= 200 && lastStatus < 300) break;
+      } catch (Exception ignored) {
+        lastStatus = 0;
+      }
+      if (attempt < 3) {
+        try { Thread.sleep(200L * (1L << (attempt - 1))); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+      }
+    }
+
+    Map<String, Object> log = new LinkedHashMap<String, Object>();
+    log.put("eventId", eventId);
+    log.put("paymentOrderId", order.get("paymentOrderId"));
+    log.put("bookingId", order.get("bookingId"));
+    log.put("status", status);
+    log.put("httpStatus", lastStatus);
+    log.put("timestamp", Instant.now().toString());
+
+    List<Map<String, Object>> logs = getCallbackLogs(ctx);
+    logs.add(0, log);
+    if (logs.size() > 50) logs.remove(logs.size() - 1);
+
+    if (isDbEnabled()) {
+      try (Connection conn = openDb(ctx);
+           PreparedStatement ps = conn.prepareStatement(
+               "INSERT INTO payment_callback_outbox (event_id, payment_order_id, booking_id, status, http_status) VALUES (?, ?, ?, ?, ?) ON CONFLICT (event_id) DO NOTHING")) {
+        ps.setString(1, eventId);
+        ps.setString(2, String.valueOf(order.get("paymentOrderId")));
+        ps.setString(3, String.valueOf(order.get("bookingId")));
+        ps.setString(4, status);
+        ps.setInt(5, lastStatus);
+        ps.executeUpdate();
+      } catch (SQLException ignored) {
+        // Already captured in memory log; DB outage must not crash webhook ack.
+      }
+    }
+
+    return lastStatus;
+  }
+%>
