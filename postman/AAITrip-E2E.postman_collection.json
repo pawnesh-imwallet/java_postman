@@ -1,16 +1,17 @@
 {
   "info": {
-    "name": "AAITrip E2E (Auth OTP + Java Razorpay)",
+    "name": "AAITrip E2E (Auth OTP + Step-Up + Java Razorpay)",
     "_postman_id": "aaitrip-e2e-v1",
-    "description": "Automated end-to-end flow: Mobile OTP Login (Node :4100) -> Create Payment Order (Node -> Java :8082 -> Razorpay) -> Webhook -> Order Status.\nRequires: node ./scripts/postman-signer.mjs running on http://127.0.0.1:4999",
+    "description": "Automated end-to-end flow: Mobile OTP Login (Node :4100) -> Step-Up OTP (for new web device) -> Create Payment Order (Node -> Java :8082 -> Razorpay) -> Webhook -> Order Status.\nRequires: node ./scripts/postman-signer.mjs running on http://127.0.0.1:4999",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
     { "key": "node_url", "value": "http://localhost:4100" },
     { "key": "java_url", "value": "http://localhost:8082" },
     { "key": "signer_url", "value": "http://127.0.0.1:4999" },
-    { "key": "phone", "value": "9876543210" },
+    { "key": "phone", "value": "9876543219" },
     { "key": "otp", "value": "123456" },
+    { "key": "step_up_otp", "value": "123456" },
     { "key": "razorpay_webhook_secret", "value": "" },
     { "key": "device_id", "value": "" },
     { "key": "device_public_key", "value": "" },
@@ -19,6 +20,7 @@
     { "key": "req_nonce", "value": "" },
     { "key": "req_signature", "value": "" },
     { "key": "user_access_token", "value": "" },
+    { "key": "step_up_token", "value": "" },
     { "key": "payment_order_id", "value": "" },
     { "key": "provider_order_id", "value": "" },
     { "key": "rzp_signature", "value": "" }
@@ -114,7 +116,48 @@
       }
     },
     {
-      "name": "4. Create Payment Order (Node -> Java -> Razorpay, Auto Sign)",
+      "name": "4a. Step-Up Send OTP (New Web Device Payment Confirm)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{user_access_token}}" },
+          { "key": "X-Device-ID", "value": "{{device_id}}" }
+        ],
+        "url": "{{node_url}}/api/auth/v1/step-up/send-otp"
+      }
+    },
+    {
+      "name": "4b. Step-Up Verify OTP (Saves step_up_token)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "if (json && json.data && json.data.stepUpToken) {",
+              "  pm.collectionVariables.set('step_up_token', json.data.stepUpToken);",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{user_access_token}}" },
+          { "key": "X-Device-ID", "value": "{{device_id}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"otp\": \"{{step_up_otp}}\"\n}"
+        },
+        "url": "{{node_url}}/api/auth/v1/step-up/verify"
+      }
+    },
+    {
+      "name": "5. Create Payment Order (Node -> Java -> Razorpay, Auto Sign)",
       "event": [
         {
           "listen": "prerequest",
@@ -168,7 +211,8 @@
           { "key": "Content-Type", "value": "application/json" },
           { "key": "X-Device-ID", "value": "{{device_id}}" },
           { "key": "X-Signature-Nonce", "value": "{{req_nonce}}" },
-          { "key": "X-Signature", "value": "{{req_signature}}" }
+          { "key": "X-Signature", "value": "{{req_signature}}" },
+          { "key": "X-Step-Up", "value": "{{step_up_token}}" }
         ],
         "body": {
           "mode": "raw",
@@ -178,7 +222,7 @@
       }
     },
     {
-      "name": "5. Razorpay Webhook (Java -> Node Callback, Auto HMAC)",
+      "name": "6. Razorpay Webhook (Java -> Node Callback, Auto HMAC)",
       "event": [
         {
           "listen": "prerequest",
@@ -210,7 +254,7 @@
       }
     },
     {
-      "name": "6. Get Final Payment Order Status (Node -> Java)",
+      "name": "7. Get Final Payment Order Status (Node -> Java)",
       "request": {
         "method": "GET",
         "header": [
